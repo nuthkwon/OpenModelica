@@ -249,8 +249,15 @@ fn clone_src(f: &Src) -> Result<Src, String> {
 }
 
 fn read_exact_vec(file: &mut Src, n: usize) -> Result<Vec<u8>, String> {
-    let mut buf = vec![0u8; n];
-    file.read_exact(&mut buf).map_err(|e| e.to_string())?;
+    // Grow to the bytes actually present, not to `n` up front: a corrupt or
+    // crafted header can give an `n` of billions, and `vec![0u8; n]` would abort
+    // the process (the allocation fails and cannot unwind). `read_to_end` over a
+    // `take` limiter reads only what the file holds, then we check the count.
+    let mut buf = Vec::new();
+    let read = (&mut *file).take(n as u64).read_to_end(&mut buf).map_err(|e| e.to_string())?;
+    if read != n {
+        return Err("unexpected end of file".to_string());
+    }
     Ok(buf)
 }
 
@@ -426,7 +433,10 @@ impl MatReader {
                     let mrows = hdr.mrows as usize;
                     let ncols = hdr.ncols as usize;
                     let nall = if binTrans { ncols } else { mrows };
-                    reader.allInfo = Vec::with_capacity(nall);
+                    // Not `with_capacity(nall)`: `nall` is an untrusted header
+                    // field and a crafted value would abort on the allocation.
+                    reader.allInfo = Vec::new();
+                    let _ = nall;
                     let tmp = read_chars(hdr.ty as i32, ncols * mrows, &mut file)?;
                     for k in 0..nall {
                         let bytes: Vec<u8> = if binTrans {
@@ -647,8 +657,10 @@ impl MatReader {
             }
             return Some(v);
         }
-        // Time-major: the column is `nrows` elements `nvar` apart.
-        let mut out = Vec::with_capacity(nrows);
+        // Time-major: the column is `nrows` elements `nvar` apart. `nrows` comes
+        // from the data_2 header and is not validated against the file size, so
+        // do not pre-allocate it; `disk_val` fails cleanly past EOF.
+        let mut out = Vec::new();
         for i in 0..nrows {
             let v = self.disk_val(i, absv - 1)?;
             out.push(if negate { -v } else { v });

@@ -226,8 +226,14 @@ impl WasiCtx {
     /// The file a `path_*` call names, whose path is relative to `dirfd`. libc's
     /// `*at` family passes an open directory there -- `readdir` stats each entry
     /// through the directory's own fd -- so anything but the preopen has to
-    /// contribute its path.
+    /// contribute its path. On Windows the result is mapped back to a host path
+    /// ([`host_path`]).
     fn resolve_at(&self, dirfd: u32, name: &str) -> String {
+        host_path(&self.guest_path_at(dirfd, name), cfg!(windows))
+    }
+
+    /// `name` joined onto `dirfd`'s directory: the path as the guest sees it.
+    fn guest_path_at(&self, dirfd: u32, name: &str) -> String {
         let name = name.strip_prefix("./").unwrap_or(name);
         if name.starts_with('/') {
             return name.to_string();
@@ -883,6 +889,76 @@ impl WasiCtx {
     }
 }
 
+// ─────────────────────────── Windows host paths ──────────────────────────────
+
+/// The host path for `path`, a guest name already joined onto its directory:
+/// `path` itself unless `windows`. The guest only knows `/`-rooted names, so a
+/// Windows drive path reaches us behind whatever libc (the cwd [`guest_cwd`]
+/// gives it) and the `/` preopen put in front: `/C:/sim/t.txt` for a relative
+/// name, `/C:/sim/C:/data/t.txt` for an absolute one libc took for relative. The
+/// last drive component (`X:`, never valid inside a Windows name) or `\\server`
+/// UNC start begins the host path; a name still led by `//` is UNC as it is;
+/// anything else keeps the join. Backslashes come out as `/`.
+fn host_path(path: &str, windows: bool) -> String {
+    if !windows {
+        return path.to_string();
+    }
+    let b = path.as_bytes();
+    let sep = |c: u8| c == b'/' || c == b'\\';
+    let mut start = None;
+    for i in 0..b.len() {
+        if i > 0 && !sep(b[i - 1]) {
+            continue;
+        }
+        let drive =
+            b[i].is_ascii_alphabetic() && b.get(i + 1) == Some(&b':') && b.get(i + 2).is_none_or(|&c| sep(c));
+        let unc = b[i..].starts_with(b"\\\\")
+            && (i == 0 || b[i - 1] == b'/')
+            && b.get(i + 2).is_some_and(|&c| !sep(c));
+        if drive || unc {
+            start = Some(i);
+        }
+    }
+    let host = path[start.unwrap_or(0)..].replace('\\', "/");
+    match start {
+        // A bare `C:` would be the drive's own cwd, not its root.
+        Some(_) if host.len() == 2 => host + "/",
+        Some(_) => host,
+        // The preopen join adds a `/` in front of one.
+        None if host.starts_with("//") => format!("//{}", host.trim_start_matches('/')),
+        None => host,
+    }
+}
+
+/// What a guest's libc gets as its working directory (`__wasilibc_cwd`) for the
+/// host's `cwd`. wasi-libc takes a cwd for absolute only when it starts with `/`,
+/// puts it in front of every relative name and strips the leading `/`s before the
+/// preopen lookup. So on Windows the cwd goes over `/`-rooted with forward
+/// slashes (`C:\sim` -> `/C:/sim`), and [`host_path`] maps what comes back
+/// (`/C:/sim/t.txt`) to the host path again. Elsewhere it is `cwd` as it is.
+pub fn guest_cwd(cwd: &str) -> String {
+    guest_cwd_for(cwd, cfg!(windows))
+}
+
+fn guest_cwd_for(cwd: &str, windows: bool) -> String {
+    if !windows {
+        return cwd.to_string();
+    }
+    // A `\\?\` verbatim prefix (`canonicalize`) takes no `/`, so it goes first.
+    let (unc, rest) = if let Some(r) = cwd.strip_prefix(r"\\?\UNC\") {
+        (true, r)
+    } else if let Some(r) = cwd.strip_prefix(r"\\?\") {
+        (false, r)
+    } else if let Some(r) = cwd.strip_prefix(r"\\").or_else(|| cwd.strip_prefix("//")) {
+        (true, r)
+    } else {
+        (false, cwd)
+    };
+    let rest = rest.replace('\\', "/");
+    // A UNC cwd keeps its leading `\\`: libc would strip a `//` down to `/`.
+    if unc { format!(r"/\\{rest}") } else { format!("/{rest}") }
+}
+
 /// A regular file's `st_ino`, from its path so the same file keeps it across
 /// opens. HDF5's sec2 driver identifies an open file by `st_dev`/`st_ino`, so
 /// the pair has to differ between files. Never 0, which means "no inode".
@@ -1115,5 +1191,69 @@ mod path_ops_tests {
         assert_eq!(ctx.fd_filestat_get(&mut mem, 3, 4096), ERRNO_SUCCESS);
         assert_eq!(u64::from_le_bytes(mem.0[4104..4112].try_into().unwrap()), 0);
         let _ = crate::fs::remove_dir_all(&root);
+    }
+
+    /// Windows: what libc and the preopen put in front of a host path comes off.
+    #[test]
+    fn windows_host_paths() {
+        let w = |p: &str| host_path(p, true);
+        // Drive-letter names, as given and behind the `/` preopen.
+        assert_eq!(w("C:/data/t.txt"), "C:/data/t.txt");
+        assert_eq!(w(r"C:\data\t.txt"), "C:/data/t.txt");
+        assert_eq!(w("/C:/a"), "C:/a");
+        assert_eq!(w("/c:"), "c:/");
+        // Behind the cwd: a relative name, absolute ones libc took for relative.
+        assert_eq!(w("/C:/Users/x/sim/table.txt"), "C:/Users/x/sim/table.txt");
+        assert_eq!(w("x/y/C:/data/t.txt"), "C:/data/t.txt");
+        assert_eq!(w("/C:/Users/x/sim/D:/data/t.txt"), "D:/data/t.txt");
+        assert_eq!(w(r"/C:\Users\x\sim/C:\data\t.txt"), "C:/data/t.txt");
+        // UNC.
+        assert_eq!(w("//server/share/t.txt"), "//server/share/t.txt");
+        assert_eq!(w("///server/share/t.txt"), "//server/share/t.txt");
+        assert_eq!(w(r"/\\server\share\t.txt"), "//server/share/t.txt");
+        assert_eq!(w(r"/C:/sim/\\server\share\t.txt"), "//server/share/t.txt");
+        assert_eq!(w(r"/\\server/share/sim/C:/data/t.txt"), "C:/data/t.txt");
+        // Plain names keep the join.
+        assert_eq!(w("table.txt"), "table.txt");
+        assert_eq!(w("/sim/table.txt"), "/sim/table.txt");
+        assert_eq!(w(r"/sim\out\t.txt"), "/sim/out/t.txt");
+        assert_eq!(w("/sim/AB:/C:x/t.txt"), "/sim/AB:/C:x/t.txt");
+        assert_eq!(w("C:/data//t.txt"), "C:/data//t.txt");
+        // Elsewhere nothing changes.
+        assert_eq!(host_path("x/y/C:/data/t.txt", false), "x/y/C:/data/t.txt");
+        assert_eq!(host_path(r"/\\server\share", false), r"/\\server\share");
+    }
+
+    #[test]
+    fn windows_guest_cwd() {
+        let w = |p: &str| guest_cwd_for(p, true);
+        assert_eq!(w(r"C:\Users\x\sim"), "/C:/Users/x/sim");
+        assert_eq!(w(r"\\?\C:\"), "/C:/");
+        assert_eq!(w(r"\\?\C:\Users\x\sim"), "/C:/Users/x/sim");
+        assert_eq!(w(r"\\?\UNC\server\share\sim"), r"/\\server/share/sim");
+        assert_eq!(w(r"\\server\share\sim"), r"/\\server/share/sim");
+        assert_eq!(guest_cwd_for("/home/x/sim", false), "/home/x/sim");
+        assert_eq!(guest_cwd_for(r"C:\x", false), r"C:\x");
+    }
+
+    /// A Windows open end to end: libc puts the cwd [`guest_cwd`] gave it in front
+    /// of a relative name and strips the leading `/`s for the `/` preopen (fd 4),
+    /// which joins its own `/` back on.
+    #[test]
+    fn windows_open_through_libc_cwd() {
+        let ctx = WasiCtx::new("/", Vec::new());
+        let open = |cwd: &str, name: &str| {
+            let abs = if name.starts_with('/') { name.to_string() } else { format!("{cwd}/{name}") };
+            host_path(&ctx.guest_path_at(PREOPEN_FD + 1, abs.trim_start_matches('/')), true)
+        };
+        let cwd = guest_cwd_for(r"C:\Users\x\sim", true);
+        assert_eq!(open(&cwd, "table.txt"), "C:/Users/x/sim/table.txt");
+        assert_eq!(open(&cwd, "out/res.csv"), "C:/Users/x/sim/out/res.csv");
+        assert_eq!(open(&cwd, "C:/data/t.txt"), "C:/data/t.txt");
+        assert_eq!(open(&cwd, r"D:\data\t.txt"), "D:/data/t.txt");
+        assert_eq!(open(&cwd, r"\\server\share\t.txt"), "//server/share/t.txt");
+        let unc = guest_cwd_for(r"\\?\UNC\server\share\sim", true);
+        assert_eq!(open(&unc, "table.txt"), "//server/share/sim/table.txt");
+        assert_eq!(open(&unc, "C:/data/t.txt"), "C:/data/t.txt");
     }
 }

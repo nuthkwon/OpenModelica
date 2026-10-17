@@ -227,6 +227,11 @@ impl PltReader {
     pub fn dataset(&self, var: &str, datasize: usize) -> Option<Vec<f64>> {
         let header = format!("DataSet: {var}");
         let start = self.lines.iter().position(|l| *l == header)? + 1;
+        // `datasize` comes from `#IntervalSize` in the file and is not trusted;
+        // a dataset cannot have more values than there are lines left, so cap it
+        // there. Otherwise a crafted size would abort on `with_capacity` or spin
+        // the loop padding with NaN.
+        let datasize = datasize.min(self.lines.len().saturating_sub(start));
         let mut out = Vec::with_capacity(datasize);
         for j in 0..datasize {
             let line = self.lines.get(start + j).map(String::as_str).unwrap_or("");

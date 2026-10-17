@@ -244,7 +244,8 @@ pub fn load(
 
 /// Give libc the process's own working directory: `__wasilibc_find_relpath`
 /// resolves every path a library opens against `__wasilibc_cwd`, which is `"/"` out
-/// of the box. A later `chdir` frees only a buffer libc allocated itself.
+/// of the box. A later `chdir` frees only a buffer libc allocated itself. A
+/// Windows cwd goes over `/`-rooted ([`openmodelica_wasi::wasi::guest_cwd`]).
 fn set_guest_cwd(
     store: &mut wasmtime::Store<HostState>,
     rt_alloc: &wasmtime::TypedFunc<u32, u32>,
@@ -254,6 +255,7 @@ fn set_guest_cwd(
     let (Some(&slot), Ok(cwd)) = (loaded.data.get("__wasilibc_cwd"), openmodelica_wasi::fs::cwd()) else {
         return Ok(());
     };
+    let cwd = openmodelica_wasi::wasi::guest_cwd(&cwd);
     let bytes = cwd.as_bytes();
     let p = rt_alloc
         .call(&mut *store, bytes.len() as u32 + 1)

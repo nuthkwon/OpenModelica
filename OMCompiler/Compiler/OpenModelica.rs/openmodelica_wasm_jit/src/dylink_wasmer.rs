@@ -312,12 +312,13 @@ fn cwd() -> String {
 }
 
 /// Give libc the process's own working directory: `__wasilibc_find_relpath`
-/// resolves every relative path a library opens against `__wasilibc_cwd`.
+/// resolves every relative path a library opens against `__wasilibc_cwd`. A
+/// Windows cwd goes over `/`-rooted ([`openmodelica_wasi::wasi::guest_cwd`]).
 fn set_guest_cwd(store: &mut Store, memory: &Memory, data: &HashMap<String, u32>) -> Result<()> {
     let (Some(&slot), Ok(dir)) = (data.get("__wasilibc_cwd"), openmodelica_wasi::fs::cwd()) else {
         return Ok(());
     };
-    let mut bytes = dir.into_bytes();
+    let mut bytes = openmodelica_wasi::wasi::guest_cwd(&dir).into_bytes();
     bytes.push(0);
     let Some(off) = grow_for(store, memory, bytes.len() as u32) else { return Ok(()) };
     let view = memory.view(&*store);
